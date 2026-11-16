@@ -2,6 +2,11 @@
 // port it bound, then poll until the env says the trial is over and exit 0. Keep this file as it is:
 // the suite scores the server app.ts builds, and the lifecycle is the harness's, not the contest's.
 //
+// This entry's server lives in app.ts: a GitHub-core clone (REST, GraphQL and MCP over a
+// content-addressed git object store in src/) that speaks the trial env's wire protocol.
+// main.ts only wires that server to the harness lifecycle above; it imports its own
+// server and nothing else: no package, no Node built-in, no model call.
+//
 //   1. MAKEFUN_ENV_URL names the env's origin (http://store:8080 in a trial container). Without it
 //      there is nothing to talk to, so the program exits 1 at once.
 //   2. Create the server and listen(0): the kernel picks a free port. Never bind 8080 — the env owns it.
