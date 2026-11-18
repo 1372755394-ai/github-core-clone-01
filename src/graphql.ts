@@ -699,6 +699,7 @@ function resolveRootField(ctx: Ctx, field: FieldNode, variables: Record<string, 
       found.issue.state = 'closed';
       found.issue.closed_at = store.clock.nowIso();
       found.issue.updated_at = found.issue.closed_at;
+      store.invalidateIssueViewJson(found.issue);
       return { __type: 'CloseIssuePayload', repo: found.repo, issue: found.issue };
     }
     case 'createPullRequest': {
@@ -732,6 +733,7 @@ function resolveRootField(ctx: Ctx, field: FieldNode, variables: Record<string, 
         const now = store.clock.nowIso();
         const comment = { id: store.allocateId(), body, user: { login: VIEWER.login, id: VIEWER.id }, created_at: now, updated_at: now };
         issue.issue.comments.push(comment);
+        store.invalidateIssueViewJson(issue.issue);
         return { __type: 'AddCommentPayload', repo: issue.repo, issueNumber: issue.issue.number, comment: { id: comment.id, body } };
       }
       const pull = findPullByGid(store, subjectId);

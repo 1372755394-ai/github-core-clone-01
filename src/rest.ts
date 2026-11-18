@@ -24,6 +24,24 @@ const json = (status: number, value: unknown, headers: Record<string, string> = 
   body: JSON.stringify(value),
 });
 
+/** A reply whose JSON body is already serialized (see issueViewJson). */
+const jsonText = (status: number, body: string, headers: Record<string, string> = {}): RestResponse => ({
+  status,
+  headers: { 'content-type': 'application/json; charset=utf-8', ...headers },
+  body,
+});
+
+// Serialized issue views live on the Store (see Store.issueViewJsonCache): an issue's view
+// is a pure function of its fields and its repository, so the read workload's 2,000 GETs of
+// one issue serialize it once. Every mutation path invalidates it via the Store.
+function issueViewJson(store: Store, issue: Issue, repo: Repo): string {
+  const hit = store.cachedIssueViewJson(issue);
+  if (hit !== undefined) return hit;
+  const body = JSON.stringify(issueView(issue, repo));
+  store.setCachedIssueViewJson(issue, body);
+  return body;
+}
+
 const error = (status: number, message: string): RestResponse => json(status, { message });
 
 function parseBody(request: RestRequest): { ok: true; value: Record<string, unknown> } | { ok: false; response: RestResponse } {
@@ -256,7 +274,7 @@ export function handleRest(store: Store, request: RestRequest): RestResponse {
       if (!ref || !sha) return error(422, 'ref and sha are required');
       if (repo.refs.has(ref)) return error(422, `Reference ${ref} already exists`);
       if (!repo.objects.has(sha)) return error(422, `Object ${sha} does not exist`);
-      repo.refs.set(ref, sha);
+      store.setRef(repo, ref, sha);
       return json(201, { ref, object: { sha, type: repo.objects.get(sha)!.type, url: `https://example.invalid/repos/${repo.full_name}/git/${repo.objects.get(sha)!.type}s/${sha}` } });
     }
     if (method === 'GET' && rest.length >= 3) {
@@ -454,8 +472,8 @@ function handleIssues(store: Store, repo: Repo, request: RestRequest, rest: stri
           : a.number - b.number;
         return direction === 'asc' ? cmp : -cmp;
       });
-      const { page, headers } = paginate(list.map((issue) => issueView(issue, repo)), request, `/api/v3/repos/${repo.owner.login}/${repo.name}/issues`);
-      return json(200, page, headers);
+      const { page, headers } = paginate(list.map((issue) => issueViewJson(store, issue, repo)), request, `/api/v3/repos/${repo.owner.login}/${repo.name}/issues`);
+      return jsonText(200, `[${page.join(',')}]`, headers);
     }
     if (request.method === 'POST') {
       const parsed = parseBody(request);
@@ -466,7 +484,7 @@ function handleIssues(store: Store, repo: Repo, request: RestRequest, rest: stri
       const labelNames = Array.isArray(parsed.value.labels) ? parsed.value.labels.filter((entry): entry is string => typeof entry === 'string') : [];
       try {
         const issue = store.createIssue(repo, title, body, labelNames);
-        return json(201, issueView(issue, repo));
+        return jsonText(201, issueViewJson(store, issue, repo));
       } catch (err) {
         return error(422, err instanceof Error ? err.message : 'label not found');
       }
@@ -478,7 +496,7 @@ function handleIssues(store: Store, repo: Repo, request: RestRequest, rest: stri
   const issue = repo.issues.find((entry) => entry.number === number);
   if (!issue) return error(404, 'Not Found');
   if (rest.length === 1) {
-    if (request.method === 'GET') return json(200, issueView(issue, repo));
+    if (request.method === 'GET') return jsonText(200, issueViewJson(store, issue, repo));
     if (request.method === 'PATCH') {
       const parsed = parseBody(request);
       if (!parsed.ok) return parsed.response;
@@ -492,7 +510,8 @@ function handleIssues(store: Store, repo: Repo, request: RestRequest, rest: stri
         issue.closed_at = state === 'closed' ? store.clock.nowIso() : null;
       }
       issue.updated_at = store.clock.nowIso();
-      return json(200, issueView(issue, repo));
+      store.invalidateIssueViewJson(issue);
+      return jsonText(200, issueViewJson(store, issue, repo));
     }
     return error(404, 'Not Found');
   }
@@ -515,6 +534,7 @@ function handleIssues(store: Store, repo: Repo, request: RestRequest, rest: stri
         updated_at: now,
       };
       issue.comments.push(comment);
+      store.invalidateIssueViewJson(issue);
       return json(201, commentView(comment, repo, number));
     }
     return error(404, 'Not Found');

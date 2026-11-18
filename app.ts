@@ -7,19 +7,23 @@ import { handleRest } from './src/rest.ts';
 import { executeGraphQL } from './src/graphql.ts';
 import { handleMcp } from './src/mcp.ts';
 import {
+  cachedAdvertisementV0,
   handleReceivePack,
   handleUploadPackV0,
   handleUploadPackV2,
-  receivePackAdvertisementV0,
-  uploadPackAdvertisementV0,
-  uploadPackAdvertisementV2,
+  V2_ADVERTISEMENT,
 } from './src/gitproto.ts';
 
 const MAX_BODY_BYTES = 256 * 1024 * 1024;
 
+/** Shared empty query params: most requests carry no query string. */
+const EMPTY_QUERY = new URLSearchParams();
+
 export function createApp(): Server {
   const store = new Store();
   const expectedToken = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+  /** Prebuilt `Authorization` value: compared, not rebuilt, on every request. */
+  const expectedAuth = expectedToken === '' ? '' : `Bearer ${expectedToken}`;
   let requestCounter = 0;
 
   const server = createServer((request, response) => {
@@ -49,7 +53,7 @@ export function createApp(): Server {
     // Auth: every other route needs the shop token (when the env sets one).
     if (expectedToken !== '') {
       const header = request.headers.authorization ?? '';
-      if (header !== `Bearer ${expectedToken}`) {
+      if (header !== expectedAuth) {
         sendJson(response, 401, { message: 'Unauthorized' });
         return;
       }
@@ -71,7 +75,7 @@ export function createApp(): Server {
         const result = handleRest(store, {
           method,
           pathname: restPath,
-          query: new URLSearchParams(search),
+          query: search === '' ? EMPTY_QUERY : new URLSearchParams(search),
           bodyText: body.toString('utf8'),
           host: request.headers.host ?? 'entry.invalid',
         });
@@ -148,12 +152,12 @@ export function createApp(): Server {
     if (service === 'info/refs' && method === 'GET') {
       const serviceParam = new URLSearchParams(search).get('service') ?? '';
       if (serviceParam === 'git-upload-pack') {
-        const advertisement = gitProtocol === 2 ? uploadPackAdvertisementV2() : uploadPackAdvertisementV0(repo);
+        const advertisement = gitProtocol === 2 ? V2_ADVERTISEMENT : cachedAdvertisementV0(repo, 'upload');
         send(response, 200, advertisement, 'application/x-git-upload-pack-advertisement');
         return;
       }
       if (serviceParam === 'git-receive-pack') {
-        send(response, 200, receivePackAdvertisementV0(repo), 'application/x-git-receive-pack-advertisement');
+        send(response, 200, cachedAdvertisementV0(repo, 'receive'), 'application/x-git-receive-pack-advertisement');
         return;
       }
       sendJson(response, 400, { message: 'unknown service' });
@@ -196,19 +200,33 @@ export function createApp(): Server {
   async function readBody(request: IncomingMessage, response: ServerResponse): Promise<Buffer | null> {
     const chunks: Buffer[] = [];
     let total = 0;
+    let tooLarge = false;
     try {
-      for await (const chunk of request) {
-        const buffer = chunk as Buffer;
-        total += buffer.length;
-        if (total > MAX_BODY_BYTES) {
-          sendJson(response, 413, { message: 'request body too large' });
-          return null;
-        }
-        chunks.push(buffer);
-      }
+      // data/end listeners instead of the async iterator: fewer microtasks per chunk for
+      // the small bodies the timed workloads send (one chunk each).
+      await new Promise<void>((resolve, reject) => {
+        request.on('data', (chunk: Buffer) => {
+          total += chunk.length;
+          if (total > MAX_BODY_BYTES) {
+            if (!tooLarge) {
+              tooLarge = true;
+              sendJson(response, 413, { message: 'request body too large' });
+              request.destroy();
+            }
+            return;
+          }
+          chunks.push(chunk);
+        });
+        request.on('end', resolve);
+        // A client that disconnects mid-body never emits 'end': 'close' settles the
+        // wait instead (the socket is gone, so the partial body is never answered).
+        request.on('close', resolve);
+        request.on('error', reject);
+      });
     } catch {
       return null;
     }
+    if (tooLarge) return null;
     return Buffer.concat(chunks);
   }
 

@@ -122,6 +122,8 @@ export interface Repo {
   stargazers_count: number;
   objects: Map<string, GitObject>;
   refs: Map<string, string>; // refname -> oid
+  /** Bumped on every ref write; git advertisement/fetch caches key on it. */
+  refsVersion: number;
   labels: Label[];
   issues: Issue[];
   pulls: PullRequest[];
@@ -198,6 +200,7 @@ export class Store {
       stargazers_count: 0,
       objects: new Map(),
       refs: new Map(),
+      refsVersion: 0,
       labels: this.defaultLabels(),
       issues: [],
       pulls: [],
@@ -211,6 +214,35 @@ export class Store {
 
   getRepo(owner: string, name: string): Repo | undefined {
     return this.repos.get(`${owner}/${name}`);
+  }
+
+  /** Serialized REST issue views, keyed by issue: an issue's view is a pure function of its
+   * fields and its repository, so repeated GETs of one issue serialize it once. Every code
+   * path that mutates an issue (REST PATCH/comment, GraphQL closeIssue/addComment) must call
+   * invalidateIssueViewJson first — a stale entry is a wrong answer, not just slow. */
+  private issueViewJsonCache = new WeakMap<Issue, string>();
+
+  cachedIssueViewJson(issue: Issue): string | undefined {
+    return this.issueViewJsonCache.get(issue);
+  }
+
+  setCachedIssueViewJson(issue: Issue, json: string): void {
+    this.issueViewJsonCache.set(issue, json);
+  }
+
+  invalidateIssueViewJson(issue: Issue): void {
+    this.issueViewJsonCache.delete(issue);
+  }
+
+  /** Write a ref and bump the repo's refs version (invalidates git advertisement caches). */
+  setRef(repo: Repo, ref: string, oid: string): void {
+    repo.refs.set(ref, oid);
+    repo.refsVersion += 1;
+  }
+
+  /** Delete a ref and bump the repo's refs version (invalidates git advertisement caches). */
+  deleteRef(repo: Repo, ref: string): void {
+    if (repo.refs.delete(ref)) repo.refsVersion += 1;
   }
 
   repoView(repo: Repo): RepoView {
@@ -401,7 +433,7 @@ export class Store {
     void committerLogin;
     const commitData = buildCommit(treeOid, parents, author, committer, message);
     const commitOid = this.storeObject(repo, 'commit', commitData);
-    repo.refs.set(`refs/heads/${branch}`, commitOid);
+    this.setRef(repo, `refs/heads/${branch}`, commitOid);
     repo.pushed_at = this.clock.nowIso();
     return commitOid;
   }
@@ -564,7 +596,7 @@ export class Store {
     const message = `${pull.title} (#${pull.number})\n`;
     const commitData = buildCommit(treeOid, [baseSha], author, committer, message);
     const commitOid = this.storeObject(repo, 'commit', commitData);
-    repo.refs.set(`refs/heads/${pull.base.ref}`, commitOid);
+    this.setRef(repo, `refs/heads/${pull.base.ref}`, commitOid);
     pull.state = 'closed';
     pull.merged = true;
     pull.merged_at = this.clock.nowIso();

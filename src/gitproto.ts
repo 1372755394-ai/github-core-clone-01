@@ -5,7 +5,6 @@ import {
   ZERO_OID,
   collectCommitsDepth,
   collectReachable,
-  hashObject,
   isObjectId,
   parseCommit,
   parseTag,
@@ -118,6 +117,37 @@ export function uploadPackAdvertisementV2(): Buffer {
     'object-format=sha1\n',
   ];
   return Buffer.concat([...lines.map((line) => pktLine(line)), pktFlush()]);
+}
+
+/** The v2 capability advertisement never varies: one shared buffer, not one per request. */
+export const V2_ADVERTISEMENT = uploadPackAdvertisementV2();
+
+// -- response caches -----------------------------------------------------------
+// Git objects are immutable and a fetch selection is a pure function of (wants, haves,
+// depth, shallow boundaries) once every named object exists, so a complete selection's
+// whole response can be reused; advertisements and ls-refs listings are pure functions
+// of the ref set, keyed on the repo's refsVersion (bumped on every ref write).
+const CACHE_MAX = 32;
+function cachePut<K, V>(cache: Map<K, V>, key: K, value: V): void {
+  if (cache.size >= CACHE_MAX) {
+    const oldest = cache.keys().next().value;
+    if (oldest !== undefined) cache.delete(oldest);
+  }
+  cache.set(key, value);
+}
+const advertisementCache = new Map<string, Buffer>();
+const lsRefsCache = new Map<string, Buffer>();
+const fetchResponseCache = new Map<string, Buffer>();
+
+export function cachedAdvertisementV0(repo: Repo, service: 'upload' | 'receive'): Buffer {
+  // objects.size too: a tag's peeled line appears when its target object arrives, which
+  // can happen on a push whose ref update fails (no ref write, so no refsVersion bump).
+  const key = `${service}|${repo.id}|${repo.refsVersion}|${repo.objects.size}`;
+  const hit = advertisementCache.get(key);
+  if (hit) return hit;
+  const value = service === 'upload' ? uploadPackAdvertisementV0(repo) : receivePackAdvertisementV0(repo);
+  cachePut(advertisementCache, key, value);
+  return value;
 }
 
 export function uploadPackAdvertisementV0(repo: Repo): Buffer {
@@ -325,6 +355,16 @@ export function handleUploadPackV2(store: Store, repo: Repo, body: Buffer): Buff
 }
 
 function handleLsRefs(repo: Repo, args: string[]): Buffer {
+  // objects.size too: peeled tag lines depend on target objects existing (see above).
+  const cacheKey = `${repo.id}|${repo.refsVersion}|${repo.objects.size}|${args.join('\n')}`;
+  const cached = lsRefsCache.get(cacheKey);
+  if (cached) return cached;
+  const built = buildLsRefs(repo, args);
+  cachePut(lsRefsCache, cacheKey, built);
+  return built;
+}
+
+function buildLsRefs(repo: Repo, args: string[]): Buffer {
   const peel = args.includes('peel');
   const symrefs = args.includes('symrefs');
   const unborn = args.includes('unborn');
@@ -373,6 +413,9 @@ function handleFetchV2(store: Store, repo: Repo, args: string[]): Buffer {
     }
     // deepen-since / deepen-not / filter / thin-pack / no-progress / ofs-delta: accepted, ignored.
   }
+  const cacheKey = `v2|${packCacheKey(repo, wants, haves, depth)}|${[...shallowBoundaries].sort().join(',')}`;
+  const cachedResponse = fetchResponseCache.get(cacheKey);
+  if (cachedResponse) return cachedResponse;
   const selection = selectFetchObjects(store, repo, wants, haves, depth, shallowBoundaries);
   const parts: Buffer[] = [];
   // acknowledgments
@@ -397,7 +440,11 @@ function handleFetchV2(store: Store, repo: Repo, args: string[]): Buffer {
   const pack = cachedPack(repo, wants, haves, depth, selection);
   parts.push(sidebandData(pack));
   parts.push(pktFlush());
-  return Buffer.concat(parts);
+  const out = Buffer.concat(parts);
+  // A complete selection's response is a pure function of the cached key (git objects are
+  // immutable and only ever added), so the 50 concurrent clones share one built response.
+  if (selection.complete && out.length < 1024 * 1024) cachePut(fetchResponseCache, cacheKey, out);
+  return out;
 }
 
 export function handleUploadPackV0(store: Store, repo: Repo, body: Buffer): Buffer {
@@ -465,9 +512,9 @@ export function handleReceivePack(store: Store, repo: Repo, body: Buffer): { sta
     } catch (error) {
       return badReport(`unpack error: ${error instanceof Error ? error.message : 'bad pack'}`);
     }
+    // readPack already keys every object by hashObject(type, data): the oid IS the verified
+    // hash, so re-hashing each object here was pure redundancy.
     for (const [oid, object] of parsedPack.objects) {
-      const expected = hashObject(object.type, object.data);
-      if (expected !== oid) return badReport('pack object hash mismatch');
       if (!repo.objects.has(oid)) repo.objects.set(oid, object);
     }
   }
@@ -479,7 +526,7 @@ export function handleReceivePack(store: Store, repo: Repo, body: Buffer): { sta
       if (!current) {
         results.push({ ref: command.ref, ok: false, reason: 'remote ref does not exist' });
       } else {
-        repo.refs.delete(command.ref);
+        store.deleteRef(repo, command.ref);
         results.push({ ref: command.ref, ok: true, reason: '' });
       }
       continue;
@@ -493,7 +540,7 @@ export function handleReceivePack(store: Store, repo: Repo, body: Buffer): { sta
         results.push({ ref: command.ref, ok: false, reason: 'non-fast-forward' });
         continue;
       }
-      repo.refs.set(command.ref, command.newOid);
+      store.setRef(repo, command.ref, command.newOid);
       results.push({ ref: command.ref, ok: true, reason: '' });
       continue;
     }
@@ -510,7 +557,7 @@ export function handleReceivePack(store: Store, repo: Repo, body: Buffer): { sta
       results.push({ ref: command.ref, ok: false, reason: 'non-fast-forward' });
       continue;
     }
-    repo.refs.set(command.ref, command.newOid);
+    store.setRef(repo, command.ref, command.newOid);
     results.push({ ref: command.ref, ok: true, reason: '' });
   }
   repo.pushed_at = store.clock.nowIso();
